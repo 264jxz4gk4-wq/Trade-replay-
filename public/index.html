@@ -9,12 +9,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <style>
   * { box-sizing: border-box; }
-  body { margin: 0; background:#0a0e0f; font-family: 'IBM Plex Mono','SF Mono',monospace; color:#d8e0e0; }
+  body { margin: 0; background:#eef1f4; font-family: 'IBM Plex Mono','SF Mono',monospace; color:#1a2733; }
   button { font-family: inherit; cursor:pointer; }
   button:disabled { opacity:.35; cursor:not-allowed; }
   input, select { font-family: inherit; }
   ::-webkit-scrollbar { width:6px; height:6px; }
-  ::-webkit-scrollbar-thumb { background:#2a3336; border-radius:3px; }
+  ::-webkit-scrollbar-thumb { background:#d6dbe0; border-radius:3px; }
 </style>
 </head>
 <body>
@@ -84,17 +84,17 @@ function TickerSearch({ onPick }) {
         value={q}
         onChange={e=>setQ(e.target.value)}
         placeholder="Search ticker, e.g. GME, AAPL, TSLA"
-        style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"10px 12px",fontSize:14}}
+        style={{width:"100%",background:"#ffffff",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"10px 12px",fontSize:14}}
       />
-      {loading && <div style={{fontSize:11,color:"#6b7680",marginTop:4}}>searching...</div>}
-      {err && <div style={{fontSize:11,color:"#ff5d5d",marginTop:4}}>{err}</div>}
+      {loading && <div style={{fontSize:11,color:"#5b6670",marginTop:4}}>searching...</div>}
+      {err && <div style={{fontSize:11,color:"#c0202f",marginTop:4}}>{err}</div>}
       {results.length>0 && (
-        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:6,marginTop:6,maxHeight:220,overflowY:"auto"}}>
+        <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:6,marginTop:6,maxHeight:220,overflowY:"auto"}}>
           {results.map((r,i)=>(
             <div key={i} onClick={()=>{onPick(r.symbol); setResults([]); setQ(r.symbol);}}
-              style={{padding:"8px 12px",borderTop:i>0?"1px solid #1a2224":"none",fontSize:12,display:"flex",justifyContent:"space-between"}}>
-              <span style={{color:"#3ddc84",fontWeight:700}}>{r.symbol}</span>
-              <span style={{color:"#6b7680"}}>{r.name} · {r.exchange}</span>
+              style={{padding:"8px 12px",borderTop:i>0?"1px solid #e3e7ea":"none",fontSize:12,display:"flex",justifyContent:"space-between"}}>
+              <span style={{color:"#0a7d34",fontWeight:700}}>{r.symbol}</span>
+              <span style={{color:"#5b6670"}}>{r.name} · {r.exchange}</span>
             </div>
           ))}
         </div>
@@ -121,8 +121,17 @@ function App(){
   const [orderQty,setOrderQty]=useState(100);
   const [contracts,setContracts]=useState(1);
   const [expiryOffsetIdx,setExpiryOffsetIdx]=useState(null);
+  const [positionMode,setPositionMode]=useState("buy");
+  const [actionMsg,setActionMsg]=useState(null);
   const [ended,setEnded]=useState(false);
   const intervalRef=useRef(null);
+  const msgTimer=useRef(null);
+
+  function flash(ok,text){
+    setActionMsg({ok,text});
+    if(msgTimer.current) clearTimeout(msgTimer.current);
+    msgTimer.current=setTimeout(()=>setActionMsg(null),3500);
+  }
 
   async function loadData(){
     setLoading(true); setLoadErr(""); setPlaying(false); setEnded(false);
@@ -163,16 +172,32 @@ function App(){
   useEffect(()=>{
     if(!bars.length) return;
     setOptions(opts=>{
-      const stillOpen=[]; let cashDelta=0; const newLogs=[];
+      const stillOpen=[]; let cashDelta=0; let shareDelta=0; const newLogs=[];
       for(const o of opts){
         if(idx>=o.expiryIdx){
+          const itm = o.type==="call" ? price>o.strike : price<o.strike;
           const intrinsic = o.type==="call" ? Math.max(0,price-o.strike) : Math.max(0,o.strike-price);
-          cashDelta += intrinsic*100*o.contracts;
-          newLogs.push(`${o.type.toUpperCase()} $${o.strike.toFixed(2)} expired ${intrinsic>0?"ITM":"worthless"} — ${intrinsic>0?"+$"+fmt(intrinsic*100*o.contracts):"$0"}`);
+          if(o.side==="long"){
+            cashDelta += intrinsic*100*o.contracts;
+            newLogs.push(`${o.type.toUpperCase()} $${o.strike.toFixed(2)} (long) expired ${itm?"ITM":"worthless"} — ${itm?"+$"+fmt(intrinsic*100*o.contracts):"$0"}`);
+          } else {
+            if(itm && o.type==="call"){
+              shareDelta -= 100*o.contracts;
+              cashDelta += o.strike*100*o.contracts;
+              newLogs.push(`Covered call $${o.strike.toFixed(2)} assigned — shares called away @ $${o.strike.toFixed(2)}`);
+            } else if(itm && o.type==="put"){
+              shareDelta += 100*o.contracts;
+              cashDelta -= o.strike*100*o.contracts;
+              newLogs.push(`Cash-secured put $${o.strike.toFixed(2)} assigned — bought shares @ $${o.strike.toFixed(2)}`);
+            } else {
+              newLogs.push(`Short ${o.type.toUpperCase()} $${o.strike.toFixed(2)} expired worthless — kept full premium`);
+            }
+          }
         } else stillOpen.push(o);
       }
-      if(cashDelta!==0 || newLogs.length){
+      if(cashDelta!==0 || shareDelta!==0 || newLogs.length){
         setCash(c=>c+cashDelta);
+        setShares(s=>Math.max(0,s+shareDelta));
         setLog(l=>[...newLogs.map(m=>({t:current?current.date:"", msg:m})), ...l]);
       }
       return stillOpen;
@@ -183,15 +208,18 @@ function App(){
   const buyShares=()=>{
     const qty=Number(orderQty)||0;
     const cost=qty*price;
-    if(qty<=0 || cost>cash || !current) return;
+    if(qty<=0 || !current) return;
+    if(cost>cash){ flash(false,"Not enough cash for that many shares"); return; }
     setCash(c=>c-cost); setShares(s=>s+qty);
     setLog(l=>[{t:current.date,msg:`BUY ${qty} ${symbol} @ $${fmt(price)}`},...l]);
+    flash(true,`Bought ${qty} shares @ $${fmt(price)}`);
   };
   const sellShares=()=>{
     const qty=Math.min(Number(orderQty)||0,shares);
     if(qty<=0 || !current) return;
     setCash(c=>c+qty*price); setShares(s=>s-qty);
     setLog(l=>[{t:current.date,msg:`SELL ${qty} ${symbol} @ $${fmt(price)}`},...l]);
+    flash(true,`Sold ${qty} shares @ $${fmt(price)}`);
   };
   const SPREAD = 0.04;
 
@@ -218,41 +246,75 @@ function App(){
   },[price]);
 
   function chainPrice(type,strike){
-    if(activeExpiryIdx==null) return { bid:0, ask:0 };
+    if(activeExpiryIdx==null || !Number.isFinite(price) || price<=0) return { bid:0, ask:0 };
     const T=Math.max(0,(activeExpiryIdx-idx)*T_PER_BAR_YEARS)||T_PER_BAR_YEARS;
     const mid=bsPrice(type,price,strike,T,0.05,sigma);
+    if(!Number.isFinite(mid)) return { bid:0, ask:0 };
     return { bid: Math.max(0.01,mid*(1-SPREAD)), ask: Math.max(0.02,mid*(1+SPREAD)) };
   }
 
-  const buyOptionChain=(type,strike)=>{
-    if(!current || activeExpiryIdx==null) return;
+  const sharesReserved = options.filter(o=>o.side==="short"&&o.type==="call").reduce((s,o)=>s+100*o.contracts,0);
+  const cashReserved = options.filter(o=>o.side==="short"&&o.type==="put").reduce((s,o)=>s+o.strike*100*o.contracts,0);
+
+  const tradeChain=(type,strike)=>{
+    if(!current || activeExpiryIdx==null){ flash(false,"Load data first"); return; }
     const qty=Number(contracts)||0;
-    if(qty<=0) return;
-    const { ask } = chainPrice(type,strike);
-    const cost=ask*100*qty;
-    if(cost>cash) return;
-    setCash(c=>c-cost);
-    setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,strike,expiryIdx:activeExpiryIdx,entryIdx:idx,premium:ask,contracts:qty}]);
-    setLog(l=>[{t:current.date,msg:`BUY ${qty}x ${type.toUpperCase()} $${strike} @ $${fmt(ask)} (cost $${fmt(cost)})`},...l]);
-  };
-  const closeOption=(id)=>{
-    setOptions(opts=>{
-      const o=opts.find(x=>x.id===id);
-      if(!o || !current) return opts;
-      const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
-      const mid=bsPrice(o.type,price,o.strike,T,0.05,sigma);
-      const bid=Math.max(0,mid*(1-SPREAD));
-      const proceeds=bid*100*o.contracts;
+    if(qty<=0){ flash(false,"Enter a contract quantity"); return; }
+    const { bid, ask } = chainPrice(type,strike);
+    if(!ask || !bid){ flash(false,"Price unavailable for that strike"); return; }
+
+    if(positionMode==="buy"){
+      const cost=ask*100*qty;
+      if(cost>cash){ flash(false,`Need $${fmt(cost)}, only have $${fmt(cash)} cash`); return; }
+      setCash(c=>c-cost);
+      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"long",strike,expiryIdx:activeExpiryIdx,entryIdx:idx,premium:ask,contracts:qty}]);
+      setLog(l=>[{t:current.date,msg:`BUY ${qty}x ${type.toUpperCase()} $${strike} @ $${fmt(ask)} (cost $${fmt(cost)})`},...l]);
+      flash(true,`Bought ${qty}x ${type==="call"?"call":"put"} at $${strike} strike for $${fmt(cost)} total`);
+    } else {
+      if(type==="call"){
+        const availableShares = shares - sharesReserved;
+        if(availableShares < 100*qty){
+          flash(false,`Covered call needs ${100*qty} shares free — you have ${availableShares} available`);
+          return;
+        }
+      } else {
+        const availableCash = cash - cashReserved;
+        const needed = strike*100*qty;
+        if(availableCash < needed){
+          flash(false,`Cash-secured put needs $${fmt(needed)} set aside — only $${fmt(availableCash)} free`);
+          return;
+        }
+      }
+      const proceeds=bid*100*qty;
       setCash(c=>c+proceeds);
-      setLog(l=>[{t:current.date,msg:`SELL ${o.contracts}x ${o.type.toUpperCase()} $${o.strike} @ $${fmt(bid)} (proceeds $${fmt(proceeds)})`},...l]);
-      return opts.filter(x=>x.id!==id);
-    });
+      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"short",strike,expiryIdx:activeExpiryIdx,entryIdx:idx,premium:bid,contracts:qty}]);
+      setLog(l=>[{t:current.date,msg:`SELL TO OPEN ${qty}x ${type.toUpperCase()} $${strike} @ $${fmt(bid)} (collected $${fmt(proceeds)})`},...l]);
+      flash(true,`Sold ${qty}x ${type==="call"?"covered call":"cash-secured put"} at $${strike}, collected $${fmt(proceeds)} premium`);
+    }
+  };
+
+  const closeOption=(id)=>{
+    const o=options.find(x=>x.id===id);
+    if(!o || !current) return;
+    const { bid, ask } = chainPrice(o.type, o.strike);
+    const exitPrice = o.side==="long" ? bid : ask;
+    const amount = exitPrice*100*o.contracts;
+    if(o.side==="long"){
+      setCash(c=>c+amount);
+    } else {
+      if(amount>cash){ flash(false,`Need $${fmt(amount)} cash to buy back this position`); return; }
+      setCash(c=>c-amount);
+    }
+    setOptions(opts=>opts.filter(x=>x.id!==id));
+    setLog(l=>[{t:current.date,msg:`${o.side==="long"?"SELL TO CLOSE":"BUY TO CLOSE"} ${o.contracts}x ${o.type.toUpperCase()} $${o.strike} @ $${fmt(exitPrice)}`},...l]);
+    flash(true,`Closed position for $${fmt(amount)}`);
   };
 
   const optionsValue = options.reduce((sum,o)=>{
     const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
     const mark=bsPrice(o.type,price,o.strike,T,0.05,sigma);
-    return sum+mark*100*o.contracts;
+    const sign = o.side==="short" ? -1 : 1;
+    return sum+sign*mark*100*o.contracts;
   },0);
   const equity = cash + shares*price + optionsValue;
   const pnl = equity-10000;
@@ -272,158 +334,196 @@ function App(){
   return (
     <div style={{padding:12,maxWidth:720,margin:"0 auto"}}>
       <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
-        <span style={{fontSize:18,fontWeight:700,color:"#eef4f4"}}>Trade Replay</span>
-        <span style={{fontSize:11,color:"#6b7680"}}>real historical data</span>
+        <span style={{fontSize:18,fontWeight:700,color:"#10161c"}}>Trade Replay</span>
+        <span style={{fontSize:11,color:"#5b6670"}}>real historical data</span>
       </div>
 
       <TickerSearch onPick={setSymbol} />
 
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
         <div>
-          <div style={{fontSize:9,color:"#6b7680"}}>SYMBOL</div>
+          <div style={{fontSize:9,color:"#5b6670"}}>SYMBOL</div>
           <input value={symbol} onChange={e=>setSymbol(e.target.value.toUpperCase())}
-            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+            style={{width:"100%",background:"#ffffff",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"6px 8px",fontSize:13}} />
         </div>
         <div>
-          <div style={{fontSize:9,color:"#6b7680"}}>INTERVAL</div>
+          <div style={{fontSize:9,color:"#5b6670"}}>INTERVAL</div>
           <select value={interval} onChange={e=>setInterval_(e.target.value)}
-            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}}>
+            style={{width:"100%",background:"#ffffff",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"6px 8px",fontSize:13}}>
             <option value="1day">Daily</option>
             <option value="1h">Hourly</option>
             <option value="5min">5-Minute</option>
           </select>
         </div>
         <div>
-          <div style={{fontSize:9,color:"#6b7680"}}>START DATE</div>
+          <div style={{fontSize:9,color:"#5b6670"}}>START DATE</div>
           <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}
-            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+            style={{width:"100%",background:"#ffffff",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"6px 8px",fontSize:13}} />
         </div>
         <div>
-          <div style={{fontSize:9,color:"#6b7680"}}>END DATE</div>
+          <div style={{fontSize:9,color:"#5b6670"}}>END DATE</div>
           <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)}
-            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+            style={{width:"100%",background:"#ffffff",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"6px 8px",fontSize:13}} />
         </div>
       </div>
       <button onClick={loadData} disabled={loading}
-        style={{width:"100%",background:"#1a2a24",border:"1px solid #3ddc84",color:"#3ddc84",borderRadius:6,padding:"9px",fontSize:13,fontWeight:700,marginBottom:10}}>
+        style={{width:"100%",background:"#e6f4ea",border:"1px solid #0a7d34",color:"#0a7d34",borderRadius:6,padding:"9px",fontSize:13,fontWeight:700,marginBottom:10}}>
         {loading ? "Loading real data..." : "Load Data & Reset Session"}
       </button>
-      {loadErr && <div style={{fontSize:12,color:"#ff5d5d",marginBottom:10}}>{loadErr}</div>}
+      {loadErr && <div style={{fontSize:12,color:"#c0202f",marginBottom:10}}>{loadErr}</div>}
 
       {current && (
       <React.Fragment>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
           <div style={{display:"flex",alignItems:"center",gap:10}}>
-            <span style={{fontSize:18,fontWeight:700,color:"#eef4f4"}}>${symbol}</span>
-            <span style={{fontSize:22,fontWeight:700,color: idx>0 && price>=bars[idx-1].close ? "#3ddc84":"#ff5d5d"}}>${fmt(price)}</span>
+            <span style={{fontSize:18,fontWeight:700,color:"#10161c"}}>${symbol}</span>
+            <span style={{fontSize:22,fontWeight:700,color: idx>0 && price>=bars[idx-1].close ? "#0a7d34":"#c0202f"}}>${fmt(price)}</span>
           </div>
-          <div style={{fontSize:12,color:"#f5a623",fontWeight:700,textAlign:"right"}}>
+          <div style={{fontSize:12,color:"#0060af",fontWeight:700,textAlign:"right"}}>
             {current.date}
-            <div style={{fontSize:10,color:"#6b7680",fontWeight:400}}>bar {idx+1} / {bars.length} · IV {(sigma*100).toFixed(0)}%</div>
+            <div style={{fontSize:10,color:"#5b6670",fontWeight:400}}>bar {idx+1} / {bars.length} · IV {(sigma*100).toFixed(0)}%</div>
           </div>
         </div>
 
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:10}}>
           {[
-            {label:"EQUITY",val:`$${fmt(equity)}`,color:"#eef4f4"},
-            {label:"CASH",val:`$${fmt(cash)}`,color:"#8a959a"},
-            {label:"SHARES",val:`${shares}`,color:shares>0?"#3ddc84":"#8a959a"},
-            {label:"P&L",val:`${fmtSigned(pnl)} (${fmtSigned(pnlPct)}%)`,color:pnl>=0?"#3ddc84":"#ff5d5d"},
+            {label:"EQUITY",val:`$${fmt(equity)}`,color:"#10161c"},
+            {label:"CASH",val:`$${fmt(cash)}`,color:"#5b6670"},
+            {label:"SHARES",val:`${shares}`,color:shares>0?"#0a7d34":"#5b6670"},
+            {label:"P&L",val:`${fmtSigned(pnl)} (${fmtSigned(pnlPct)}%)`,color:pnl>=0?"#0a7d34":"#c0202f"},
           ].map((b,i)=>(
-            <div key={i} style={{background:"#12181a",border:"1px solid #20282a",borderRadius:6,padding:"8px 10px"}}>
-              <div style={{fontSize:9,color:"#6b7680",letterSpacing:1}}>{b.label}</div>
+            <div key={i} style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:6,padding:"8px 10px"}}>
+              <div style={{fontSize:9,color:"#5b6670",letterSpacing:1}}>{b.label}</div>
               <div style={{fontSize:13,fontWeight:700,color:b.color}}>{b.val}</div>
             </div>
           ))}
         </div>
 
-        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
+        <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,marginBottom:10}}>
           <svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="none">
-            <polyline points={pts} fill="none" stroke="#3ddc84" strokeWidth="2" />
+            <polyline points={pts} fill="none" stroke="#0a7d34" strokeWidth="2" />
           </svg>
-          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#6b7680",marginTop:4}}>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#5b6670",marginTop:4}}>
             <span>{bars[0] && bars[0].date}</span>
             <span>{current.date}</span>
           </div>
         </div>
 
-        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:"8px 10px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:"8px 10px"}}>
           <button onClick={()=>setPlaying(p=>!p)} disabled={ended}
-            style={{background:"#3ddc84",border:"none",borderRadius:6,padding:"6px 12px",color:"#0a0e0f",fontWeight:700}}>
+            style={{background:"#0a7d34",border:"none",borderRadius:6,padding:"6px 12px",color:"#eef1f4",fontWeight:700}}>
             {playing?"Pause":"Play"}
           </button>
           {[1,2,4,8].map(s=>(
             <button key={s} onClick={()=>setSpeed(s)}
-              style={{background:speed===s?"#20282a":"transparent",border:"1px solid #20282a",color:speed===s?"#eef4f4":"#6b7680",borderRadius:6,padding:"5px 8px",fontSize:11}}>
+              style={{background:speed===s?"#d6dbe0":"transparent",border:"1px solid #d6dbe0",color:speed===s?"#10161c":"#5b6670",borderRadius:6,padding:"5px 8px",fontSize:11}}>
               {s}x
             </button>
           ))}
           <div style={{flex:1}}/>
           <button onClick={()=>{setIdx(0);setCash(10000);setShares(0);setOptions([]);setLog([]);setEnded(false);setPlaying(false);}}
-            style={{background:"transparent",border:"1px solid #20282a",color:"#8a959a",borderRadius:6,padding:"6px 10px",fontSize:11}}>
+            style={{background:"transparent",border:"1px solid #d6dbe0",color:"#5b6670",borderRadius:6,padding:"6px 10px",fontSize:11}}>
             Restart Session
           </button>
         </div>
 
         {ended && (
-          <div style={{background:"#12181a",border:`1px solid ${pnl>=0?"#3ddc84":"#ff5d5d"}`,borderRadius:8,padding:14,marginBottom:10,textAlign:"center"}}>
-            <div style={{fontSize:11,color:"#6b7680",letterSpacing:1}}>SESSION ENDED</div>
-            <div style={{fontSize:24,fontWeight:700,color:pnl>=0?"#3ddc84":"#ff5d5d"}}>{fmtSigned(pnl)} ({fmtSigned(pnlPct)}%)</div>
-            <div style={{fontSize:11,color:"#8a959a",marginTop:4}}>${symbol} · {bars[0].date} → {bars[bars.length-1].date}</div>
+          <div style={{background:"#ffffff",border:`1px solid ${pnl>=0?"#0a7d34":"#c0202f"}`,borderRadius:8,padding:14,marginBottom:10,textAlign:"center"}}>
+            <div style={{fontSize:11,color:"#5b6670",letterSpacing:1}}>SESSION ENDED</div>
+            <div style={{fontSize:24,fontWeight:700,color:pnl>=0?"#0a7d34":"#c0202f"}}>{fmtSigned(pnl)} ({fmtSigned(pnlPct)}%)</div>
+            <div style={{fontSize:11,color:"#5b6670",marginTop:4}}>${symbol} · {bars[0].date} → {bars[bars.length-1].date}</div>
           </div>
         )}
 
-        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
-          <div style={{fontSize:11,color:"#f5a623",fontWeight:700,marginBottom:8}}>SHARES</div>
+        <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,marginBottom:10}}>
+          <div style={{fontSize:11,color:"#0060af",fontWeight:700,marginBottom:8}}>SHARES</div>
           <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
             <input type="number" inputMode="numeric" value={orderQty}
               onChange={e=>setOrderQty(e.target.value)}
               onBlur={e=>setOrderQty(Math.max(1,Number(e.target.value)||1))}
-              style={{width:90,background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:12}} />
-            <span style={{fontSize:11,color:"#6b7680"}}>shares · cost ${fmt(orderQty*price)}</span>
+              style={{width:90,background:"#eef1f4",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"6px 8px",fontSize:12}} />
+            <span style={{fontSize:11,color:"#5b6670"}}>shares · cost ${fmt(orderQty*price)}</span>
             <div style={{flex:1}}/>
-            <button onClick={buyShares} disabled={ended || orderQty*price>cash}
-              style={{background:"#1a2a24",border:"1px solid #3ddc84",color:"#3ddc84",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>BUY</button>
+            <button onClick={buyShares} disabled={ended}
+              style={{background:"#e6f4ea",border:"1px solid #0a7d34",color:"#0a7d34",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>BUY</button>
             <button onClick={sellShares} disabled={ended || shares<=0}
-              style={{background:"#2a1a1a",border:"1px solid #ff5d5d",color:"#ff5d5d",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>SELL</button>
+              style={{background:"#fbe8e8",border:"1px solid #c0202f",color:"#c0202f",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>SELL</button>
           </div>
         </div>
 
-        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
-            <div style={{fontSize:11,color:"#f5a623",fontWeight:700}}>OPTIONS CHAIN</div>
+        <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,flexWrap:"wrap",gap:8}}>
+            <div style={{fontSize:11,color:"#0060af",fontWeight:700}}>OPTIONS CHAIN</div>
             <div style={{display:"flex",alignItems:"center",gap:6}}>
-              <span style={{fontSize:9,color:"#6b7680"}}>CONTRACTS</span>
+              <span style={{fontSize:9,color:"#5b6670"}}>CONTRACTS</span>
               <input type="number" inputMode="numeric" value={contracts}
                 onChange={e=>setContracts(e.target.value)}
                 onBlur={e=>setContracts(Math.max(1,Number(e.target.value)||1))}
-                style={{width:44,background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"4px 6px",fontSize:12}} />
+                style={{width:44,background:"#eef1f4",border:"1px solid #d6dbe0",color:"#10161c",borderRadius:6,padding:"4px 6px",fontSize:12}} />
             </div>
           </div>
 
-          <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:8,marginBottom:8,borderBottom:"1px solid #1a2224"}}>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            <button onClick={()=>setPositionMode("buy")}
+              style={{flex:1,background:positionMode==="buy"?"#e6f4ea":"#eef1f4",border:`1px solid ${positionMode==="buy"?"#0a7d34":"#d6dbe0"}`,color:positionMode==="buy"?"#0a7d34":"#5b6670",borderRadius:6,padding:"7px",fontSize:12,fontWeight:700}}>
+              BUY TO OPEN
+            </button>
+            <button onClick={()=>setPositionMode("sell")}
+              style={{flex:1,background:positionMode==="sell"?"#e8f0fb":"#eef1f4",border:`1px solid ${positionMode==="sell"?"#0060af":"#d6dbe0"}`,color:positionMode==="sell"?"#0060af":"#5b6670",borderRadius:6,padding:"7px",fontSize:12,fontWeight:700}}>
+              SELL TO OPEN
+            </button>
+          </div>
+          <div style={{fontSize:10,color:"#5b6670",marginBottom:8,lineHeight:1.5}}>
+            {positionMode==="buy" ? (
+              <React.Fragment>
+                <div style={{marginBottom:6}}>
+                  <b style={{color:"#0a7d34"}}>Buy a Call</b> — you're betting the stock rises above the strike before expiration. You pay the premium now. If it finishes above the strike, the call is worth the difference and gains as the stock keeps climbing. If it finishes below the strike, it expires worthless and you lose only what you paid. Max loss = premium paid. Max gain = unlimited.
+                </div>
+                <div>
+                  <b style={{color:"#c0202f"}}>Buy a Put</b> — you're betting the stock falls below the strike before expiration. You pay the premium now. If it finishes below the strike, the put is worth the difference and gains as the stock keeps falling. If it finishes above the strike, it expires worthless and you lose only what you paid. Max loss = premium paid. Max gain = large (stock could go to $0).
+                </div>
+              </React.Fragment>
+            ) : (
+              <React.Fragment>
+                <div style={{marginBottom:6}}>
+                  <b style={{color:"#0a7d34"}}>Sell a Covered Call</b> — you must already own 100+ shares per contract. You're selling someone else the right to buy those shares from you at the strike. You collect the premium immediately as income. If the stock stays below the strike, it expires worthless — you keep your shares AND the premium. If it rises above the strike, your shares get called away (sold at the strike) even though the market price is now higher — you keep the premium but give up gains above the strike.
+                </div>
+                <div>
+                  <b style={{color:"#c0202f"}}>Sell a Cash-Secured Put</b> — you set aside enough cash to buy 100 shares per contract at the strike. You're selling someone else the right to sell you their shares at the strike. You collect the premium immediately. If the stock stays above the strike, it expires worthless — you keep the cash AND the premium. If it falls below the strike, you're assigned: obligated to buy 100 shares at the strike even though the market price is now lower. The premium offsets part of that loss. Often used when you'd be happy owning the stock at that lower price anyway.
+                </div>
+              </React.Fragment>
+            )}
+          </div>
+
+          {actionMsg && (
+            <div style={{background:actionMsg.ok?"#e6f4ea":"#fbe8e8",border:`1px solid ${actionMsg.ok?"#0a7d34":"#c0202f"}`,color:actionMsg.ok?"#0a7d34":"#c0202f",borderRadius:6,padding:"8px 10px",fontSize:12,marginBottom:8,fontWeight:600}}>
+              {actionMsg.text}
+            </div>
+          )}
+
+          <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:8,marginBottom:8,borderBottom:"1px solid #e3e7ea"}}>
             {expirations.map(e=>(
               <button key={e.idx} onClick={()=>setExpiryOffsetIdx(e.idx)}
                 style={{
                   flex:"0 0 auto",
-                  background: activeExpiryIdx===e.idx ? "#1a2a24" : "#0a0e0f",
-                  border:`1px solid ${activeExpiryIdx===e.idx ? "#3ddc84" : "#20282a"}`,
-                  color: activeExpiryIdx===e.idx ? "#3ddc84" : "#8a959a",
+                  background: activeExpiryIdx===e.idx ? "#e6f4ea" : "#eef1f4",
+                  border:`1px solid ${activeExpiryIdx===e.idx ? "#0a7d34" : "#d6dbe0"}`,
+                  color: activeExpiryIdx===e.idx ? "#0a7d34" : "#5b6670",
                   borderRadius:6, padding:"6px 10px", fontSize:11, whiteSpace:"nowrap"
                 }}>
                 {e.date}
                 <div style={{fontSize:9,opacity:0.7}}>{e.daysOut}d</div>
               </button>
             ))}
-            {expirations.length===0 && <div style={{fontSize:11,color:"#6b7680"}}>No expirations left in this session</div>}
+            {expirations.length===0 && <div style={{fontSize:11,color:"#5b6670"}}>No expirations left in this session</div>}
           </div>
 
           {strikes.length>0 && activeExpiryIdx!=null && (
           <React.Fragment>
-            <div style={{display:"grid",gridTemplateColumns:"1fr 60px 1fr",gap:4,fontSize:9,color:"#6b7680",letterSpacing:1,marginBottom:4,textAlign:"center"}}>
-              <div style={{color:"#3ddc84"}}>CALLS (bid/ask)</div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 60px 1fr",gap:4,fontSize:9,color:"#5b6670",letterSpacing:1,marginBottom:4,textAlign:"center"}}>
+              <div style={{color:"#0a7d34"}}>CALLS (bid/ask)</div>
               <div>STRIKE</div>
-              <div style={{color:"#ff5d5d"}}>PUTS (bid/ask)</div>
+              <div style={{color:"#c0202f"}}>PUTS (bid/ask)</div>
             </div>
             <div style={{maxHeight:280,overflowY:"auto"}}>
               {strikes.map(strike=>{
@@ -433,49 +533,54 @@ function App(){
                 const putITM = strike > price;
                 return (
                   <div key={strike} style={{display:"grid",gridTemplateColumns:"1fr 60px 1fr",gap:4,marginBottom:3}}>
-                    <button onClick={()=>buyOptionChain("call",strike)} disabled={ended}
+                    <button onClick={()=>tradeChain("call",strike)} disabled={ended}
                       style={{
-                        background: callITM ? "#132a1e" : "#0a0e0f",
-                        border:"1px solid #20282a", borderRadius:6, padding:"6px 4px",
-                        color:"#d8e0e0", fontSize:11, textAlign:"center"
+                        background: callITM ? "#eaf6ee" : "#eef1f4",
+                        border:"1px solid #d6dbe0", borderRadius:6, padding:"6px 4px",
+                        color:"#1a2733", fontSize:11, textAlign:"center"
                       }}>
-                      <span style={{color:"#8a959a"}}>{fmt(callP.bid)}</span>{" / "}<span style={{color:"#3ddc84",fontWeight:700}}>{fmt(callP.ask)}</span>
+                      <span style={{color:"#5b6670"}}>{fmt(callP.bid)}</span>{" / "}<span style={{color:"#0a7d34",fontWeight:700}}>{fmt(callP.ask)}</span>
                     </button>
-                    <div style={{display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#eef4f4",background:"#0a0e0f",border:"1px solid #1a2224",borderRadius:6}}>
+                    <div style={{display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#10161c",background:"#eef1f4",border:"1px solid #e3e7ea",borderRadius:6}}>
                       {strike}
                     </div>
-                    <button onClick={()=>buyOptionChain("put",strike)} disabled={ended}
+                    <button onClick={()=>tradeChain("put",strike)} disabled={ended}
                       style={{
-                        background: putITM ? "#2a1318" : "#0a0e0f",
-                        border:"1px solid #20282a", borderRadius:6, padding:"6px 4px",
-                        color:"#d8e0e0", fontSize:11, textAlign:"center"
+                        background: putITM ? "#fdeceb" : "#eef1f4",
+                        border:"1px solid #d6dbe0", borderRadius:6, padding:"6px 4px",
+                        color:"#1a2733", fontSize:11, textAlign:"center"
                       }}>
-                      <span style={{color:"#8a959a"}}>{fmt(putP.bid)}</span>{" / "}<span style={{color:"#ff5d5d",fontWeight:700}}>{fmt(putP.ask)}</span>
+                      <span style={{color:"#5b6670"}}>{fmt(putP.bid)}</span>{" / "}<span style={{color:"#c0202f",fontWeight:700}}>{fmt(putP.ask)}</span>
                     </button>
                   </div>
                 );
               })}
             </div>
-            <div style={{fontSize:9,color:"#4a5458",marginTop:6,textAlign:"center"}}>tap a price to buy at the ask (right number) · shaded rows are in-the-money</div>
+            <div style={{fontSize:9,color:"#8792a0",marginTop:6,textAlign:"center"}}>
+              {positionMode==="buy" ? "tap a price to buy at the ask (right number)" : "tap a price to sell at the bid (left number)"} · shaded strikes are in-the-money
+            </div>
           </React.Fragment>
           )}
         </div>
 
         {options.length>0 && (
-          <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
-            <div style={{fontSize:11,color:"#8a959a",fontWeight:700,marginBottom:6}}>OPEN OPTIONS</div>
+          <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,marginBottom:10}}>
+            <div style={{fontSize:11,color:"#5b6670",fontWeight:700,marginBottom:6}}>OPEN POSITIONS</div>
             {options.map(o=>{
               const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
               const mark=bsPrice(o.type,price,o.strike,T,0.05,sigma);
-              const pl=(mark-o.premium)*100*o.contracts;
+              const pl = o.side==="short" ? (o.premium-mark)*100*o.contracts : (mark-o.premium)*100*o.contracts;
+              const label = o.side==="long"
+                ? `Long ${o.type}`
+                : (o.type==="call" ? "Covered Call" : "Cash-Secured Put");
               return (
-                <div key={o.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderTop:"1px solid #1a2224",fontSize:12}}>
+                <div key={o.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderTop:"1px solid #e3e7ea",fontSize:12}}>
                   <div>
-                    <span style={{color:o.type==="call"?"#3ddc84":"#ff5d5d",fontWeight:700}}>{o.type.toUpperCase()}</span> ${o.strike} × {o.contracts} · {o.expiryIdx-idx} bars left
+                    <span style={{color:o.type==="call"?"#0a7d34":"#c0202f",fontWeight:700}}>{label}</span> ${o.strike} × {o.contracts} · {o.expiryIdx-idx} bars left
                   </div>
                   <div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{color:pl>=0?"#3ddc84":"#ff5d5d"}}>{fmtSigned(pl)}</span>
-                    <button onClick={()=>closeOption(o.id)} style={{background:"transparent",border:"1px solid #20282a",color:"#8a959a",borderRadius:4,padding:"3px 6px"}}>x</button>
+                    <span style={{color:pl>=0?"#0a7d34":"#c0202f"}}>{fmtSigned(pl)}</span>
+                    <button onClick={()=>closeOption(o.id)} style={{background:"transparent",border:"1px solid #d6dbe0",color:"#5b6670",borderRadius:4,padding:"3px 6px"}}>x</button>
                   </div>
                 </div>
               );
@@ -483,12 +588,12 @@ function App(){
           </div>
         )}
 
-        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,maxHeight:160,overflowY:"auto"}}>
-          <div style={{fontSize:11,color:"#8a959a",fontWeight:700,marginBottom:6}}>TAPE</div>
-          {log.length===0 && <div style={{fontSize:11,color:"#4a5458"}}>No trades yet.</div>}
+        <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,maxHeight:160,overflowY:"auto"}}>
+          <div style={{fontSize:11,color:"#5b6670",fontWeight:700,marginBottom:6}}>TAPE</div>
+          {log.length===0 && <div style={{fontSize:11,color:"#8792a0"}}>No trades yet.</div>}
           {log.map((l,i)=>(
-            <div key={i} style={{fontSize:11,color:"#6b7680",padding:"2px 0"}}>
-              <span style={{color:"#3a4448"}}>{l.t}</span> {l.msg}
+            <div key={i} style={{fontSize:11,color:"#5b6670",padding:"2px 0"}}>
+              <span style={{color:"#8792a0"}}>{l.t}</span> {l.msg}
             </div>
           ))}
         </div>
