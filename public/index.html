@@ -27,7 +27,6 @@
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useMemo } = React;
 
-// ---------- Black-Scholes ----------
 function erf(x){const sign=x<0?-1:1;x=Math.abs(x);const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return sign*y;}
 function normCdf(x){return 0.5*(1+erf(x/Math.SQRT2));}
 function bsPrice(type,S,K,T,r,sigma){
@@ -256,18 +255,26 @@ function App(){
   const sharesReserved = options.filter(o=>o.side==="short"&&o.type==="call").reduce((s,o)=>s+100*o.contracts,0);
   const cashReserved = options.filter(o=>o.side==="short"&&o.type==="put").reduce((s,o)=>s+o.strike*100*o.contracts,0);
 
-  const tradeChain=(type,strike)=>{
+  const [pendingTrade,setPendingTrade]=useState(null);
+
+  const openTicket=(type,strike)=>{
     if(!current || activeExpiryIdx==null){ flash(false,"Load data first"); return; }
     const qty=Number(contracts)||0;
     if(qty<=0){ flash(false,"Enter a contract quantity"); return; }
     const { bid, ask } = chainPrice(type,strike);
     if(!ask || !bid){ flash(false,"Price unavailable for that strike"); return; }
+    setPendingTrade({ type, strike, mode:positionMode, qty, expiryIdx:activeExpiryIdx, bid, ask });
+  };
 
-    if(positionMode==="buy"){
+  const executeTrade=()=>{
+    if(!pendingTrade || !current) return;
+    const { type, strike, mode, qty, expiryIdx, bid, ask } = pendingTrade;
+
+    if(mode==="buy"){
       const cost=ask*100*qty;
-      if(cost>cash){ flash(false,`Need $${fmt(cost)}, only have $${fmt(cash)} cash`); return; }
+      if(cost>cash){ flash(false,`Need $${fmt(cost)}, only have $${fmt(cash)} cash`); setPendingTrade(null); return; }
       setCash(c=>c-cost);
-      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"long",strike,expiryIdx:activeExpiryIdx,entryIdx:idx,premium:ask,contracts:qty}]);
+      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"long",strike,expiryIdx,entryIdx:idx,premium:ask,contracts:qty}]);
       setLog(l=>[{t:current.date,msg:`BUY ${qty}x ${type.toUpperCase()} $${strike} @ $${fmt(ask)} (cost $${fmt(cost)})`},...l]);
       flash(true,`Bought ${qty}x ${type==="call"?"call":"put"} at $${strike} strike for $${fmt(cost)} total`);
     } else {
@@ -275,23 +282,33 @@ function App(){
         const availableShares = shares - sharesReserved;
         if(availableShares < 100*qty){
           flash(false,`Covered call needs ${100*qty} shares free — you have ${availableShares} available`);
-          return;
+          setPendingTrade(null); return;
         }
       } else {
         const availableCash = cash - cashReserved;
         const needed = strike*100*qty;
         if(availableCash < needed){
           flash(false,`Cash-secured put needs $${fmt(needed)} set aside — only $${fmt(availableCash)} free`);
-          return;
+          setPendingTrade(null); return;
         }
       }
       const proceeds=bid*100*qty;
       setCash(c=>c+proceeds);
-      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"short",strike,expiryIdx:activeExpiryIdx,entryIdx:idx,premium:bid,contracts:qty}]);
+      setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type,side:"short",strike,expiryIdx,entryIdx:idx,premium:bid,contracts:qty}]);
       setLog(l=>[{t:current.date,msg:`SELL TO OPEN ${qty}x ${type.toUpperCase()} $${strike} @ $${fmt(bid)} (collected $${fmt(proceeds)})`},...l]);
       flash(true,`Sold ${qty}x ${type==="call"?"covered call":"cash-secured put"} at $${strike}, collected $${fmt(proceeds)} premium`);
     }
+    setPendingTrade(null);
   };
+
+  function payoffAt(S, type, mode, strike, premium, qty){
+    const intrinsic = type==="call" ? Math.max(0,S-strike) : Math.max(0,strike-S);
+    const perShare = mode==="buy" ? (intrinsic-premium) : (premium-intrinsic);
+    return perShare*100*qty;
+  }
+  function breakeven(type, strike, premium){
+    return type==="call" ? strike+premium : strike-premium;
+  }
 
   const closeOption=(id)=>{
     const o=options.find(x=>x.id===id);
@@ -533,7 +550,7 @@ function App(){
                 const putITM = strike > price;
                 return (
                   <div key={strike} style={{display:"grid",gridTemplateColumns:"1fr 60px 1fr",gap:4,marginBottom:3}}>
-                    <button onClick={()=>tradeChain("call",strike)} disabled={ended}
+                    <button onClick={()=>openTicket("call",strike)} disabled={ended}
                       style={{
                         background: callITM ? "#eaf6ee" : "#eef1f4",
                         border:"1px solid #d6dbe0", borderRadius:6, padding:"6px 4px",
@@ -544,7 +561,7 @@ function App(){
                     <div style={{display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:700,color:"#10161c",background:"#eef1f4",border:"1px solid #e3e7ea",borderRadius:6}}>
                       {strike}
                     </div>
-                    <button onClick={()=>tradeChain("put",strike)} disabled={ended}
+                    <button onClick={()=>openTicket("put",strike)} disabled={ended}
                       style={{
                         background: putITM ? "#fdeceb" : "#eef1f4",
                         border:"1px solid #d6dbe0", borderRadius:6, padding:"6px 4px",
@@ -563,6 +580,72 @@ function App(){
           )}
         </div>
 
+        {pendingTrade && (()=>{
+          const { type, strike, mode, qty, bid, ask } = pendingTrade;
+          const premium = mode==="buy" ? ask : bid;
+          const totalAmount = premium*100*qty;
+          const be = breakeven(type,strike,premium);
+          const label = mode==="buy" ? `Buy ${qty}x ${type==="call"?"Call":"Put"}` : (type==="call" ? `Sell ${qty}x Covered Call` : `Sell ${qty}x Cash-Secured Put`);
+
+          const lo = Math.min(price,strike,be)*0.75;
+          const hi = Math.max(price,strike,be)*1.25;
+          const N=40;
+          const pts=[];
+          for(let i=0;i<=N;i++){
+            const S = lo + (hi-lo)*(i/N);
+            pts.push({ S, pl: payoffAt(S,type,mode,strike,premium,qty) });
+          }
+          const plVals=pts.map(p=>p.pl);
+          const plMin=Math.min(...plVals,0), plMax=Math.max(...plVals,0);
+          const W=600,H=140;
+          const xOf = S => ((S-lo)/(hi-lo))*W;
+          const yOf = pl => H - ((pl-plMin)/((plMax-plMin)||1))*H;
+          const linePts = pts.map(p=>`${xOf(p.S)},${yOf(p.pl)}`).join(" ");
+          const zeroY = yOf(0);
+          const priceX = xOf(price);
+          const strikeX = xOf(strike);
+
+          return (
+            <div style={{background:"#ffffff",border:"2px solid #0060af",borderRadius:8,padding:12,marginBottom:10}}>
+              <div style={{fontSize:12,color:"#0060af",fontWeight:700,marginBottom:8}}>REVIEW ORDER — {label}</div>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,fontSize:11,marginBottom:10}}>
+                <div style={{color:"#5b6670"}}>Strike</div><div style={{textAlign:"right",fontWeight:700}}>${strike}</div>
+                <div style={{color:"#5b6670"}}>Expiration</div><div style={{textAlign:"right",fontWeight:700}}>{expirations.find(e=>e.idx===pendingTrade.expiryIdx)?.date}</div>
+                <div style={{color:"#5b6670"}}>Quantity</div><div style={{textAlign:"right",fontWeight:700}}>{qty} contract{qty>1?"s":""} ({qty*100} shares)</div>
+                <div style={{color:"#5b6670"}}>Premium per share</div><div style={{textAlign:"right",fontWeight:700}}>${fmt(premium)}</div>
+                <div style={{color:"#5b6670"}}>{mode==="buy"?"Total cost":"Total credit"}</div>
+                <div style={{textAlign:"right",fontWeight:700,color:mode==="buy"?"#c0202f":"#0a7d34"}}>{mode==="buy"?"-":"+"}${fmt(totalAmount)}</div>
+                <div style={{color:"#5b6670"}}>Breakeven at expiration</div><div style={{textAlign:"right",fontWeight:700}}>${fmt(be)}</div>
+              </div>
+
+              <div style={{fontSize:9,color:"#5b6670",letterSpacing:1,marginBottom:4}}>PROFIT / LOSS AT EXPIRATION (by stock price)</div>
+              <svg width="100%" height={H+20} viewBox={`0 0 ${W} ${H+20}`} preserveAspectRatio="none">
+                <line x1="0" y1={zeroY} x2={W} y2={zeroY} stroke="#d6dbe0" strokeWidth="1" />
+                <line x1={strikeX} y1="0" x2={strikeX} y2={H} stroke="#0060af" strokeDasharray="3 3" strokeWidth="1" />
+                <line x1={priceX} y1="0" x2={priceX} y2={H} stroke="#5b6670" strokeDasharray="2 2" strokeWidth="1" />
+                <polyline points={linePts} fill="none" stroke={plVals[plVals.length-1]>=0?"#0a7d34":"#c0202f"} strokeWidth="2" />
+                <text x={strikeX} y={H+14} fontSize="9" fill="#0060af" textAnchor="middle">strike ${strike}</text>
+                <text x={priceX} y={H+14} fontSize="9" fill="#5b6670" textAnchor="middle">now ${fmt(price)}</text>
+              </svg>
+              <div style={{fontSize:9,color:"#8792a0",marginTop:2,marginBottom:10}}>
+                Green = profit, red = loss, at expiration for that stock price. Dashed blue = strike, dashed gray = today's price.
+              </div>
+
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={executeTrade}
+                  style={{flex:1,background:"#e6f4ea",border:"1px solid #0a7d34",color:"#0a7d34",borderRadius:6,padding:"10px",fontSize:13,fontWeight:700}}>
+                  Confirm {mode==="buy"?"Buy":"Sell"}
+                </button>
+                <button onClick={()=>setPendingTrade(null)}
+                  style={{flex:1,background:"#fbe8e8",border:"1px solid #c0202f",color:"#c0202f",borderRadius:6,padding:"10px",fontSize:13,fontWeight:700}}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          );
+        })()}
+
         {options.length>0 && (
           <div style={{background:"#ffffff",border:"1px solid #d6dbe0",borderRadius:8,padding:10,marginBottom:10}}>
             <div style={{fontSize:11,color:"#5b6670",fontWeight:700,marginBottom:6}}>OPEN POSITIONS</div>
@@ -573,15 +656,22 @@ function App(){
               const label = o.side==="long"
                 ? `Long ${o.type}`
                 : (o.type==="call" ? "Covered Call" : "Cash-Secured Put");
+              const entryTotal = o.premium*100*o.contracts;
+              const currentTotal = mark*100*o.contracts;
+              const be = breakeven(o.type,o.strike,o.premium);
               return (
-                <div key={o.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderTop:"1px solid #e3e7ea",fontSize:12}}>
-                  <div>
-                    <span style={{color:o.type==="call"?"#0a7d34":"#c0202f",fontWeight:700}}>{label}</span> ${o.strike} × {o.contracts} · {o.expiryIdx-idx} bars left
+                <div key={o.id} style={{padding:"8px 0",borderTop:"1px solid #e3e7ea",fontSize:11}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                    <span style={{color:o.type==="call"?"#0a7d34":"#c0202f",fontWeight:700,fontSize:12}}>{label} ${o.strike}</span>
+                    <button onClick={()=>closeOption(o.id)} style={{background:"transparent",border:"1px solid #d6dbe0",color:"#5b6670",borderRadius:4,padding:"3px 6px"}}>close</button>
                   </div>
-                  <div style={{display:"flex",alignItems:"center",gap:8}}>
-                    <span style={{color:pl>=0?"#0a7d34":"#c0202f"}}>{fmtSigned(pl)}</span>
-                    <button onClick={()=>closeOption(o.id)} style={{background:"transparent",border:"1px solid #d6dbe0",color:"#5b6670",borderRadius:4,padding:"3px 6px"}}>x</button>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:4,color:"#5b6670"}}>
+                    <div>Qty<div style={{color:"#10161c",fontWeight:700}}>{o.contracts}</div></div>
+                    <div>{o.side==="short"?"Collected":"Paid"}<div style={{color:"#10161c",fontWeight:700}}>${fmt(entryTotal)}</div></div>
+                    <div>Value now<div style={{color:"#10161c",fontWeight:700}}>${fmt(currentTotal)}</div></div>
+                    <div>P&L<div style={{color:pl>=0?"#0a7d34":"#c0202f",fontWeight:700}}>{fmtSigned(pl)}</div></div>
                   </div>
+                  <div style={{color:"#8792a0",marginTop:3}}>breakeven ${fmt(be)} · {o.expiryIdx-idx} bars to expiration</div>
                 </div>
               );
             })}
