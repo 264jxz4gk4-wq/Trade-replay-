@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>Trade Replay</title>
+<link rel="apple-touch-icon" href="data:image/png;base64,">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background:#0a0e0f; font-family: 'IBM Plex Mono','SF Mono',monospace; color:#d8e0e0; }
+  button { font-family: inherit; cursor:pointer; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  input, select { font-family: inherit; }
+  ::-webkit-scrollbar { width:6px; height:6px; }
+  ::-webkit-scrollbar-thumb { background:#2a3336; border-radius:3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ---------- Black-Scholes ----------
+function erf(x){const sign=x<0?-1:1;x=Math.abs(x);const a1=0.254829592,a2=-0.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=0.3275911;const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return sign*y;}
+function normCdf(x){return 0.5*(1+erf(x/Math.SQRT2));}
+function bsPrice(type,S,K,T,r,sigma){
+  if(T<=0) return type==="call"?Math.max(0,S-K):Math.max(0,K-S);
+  if(sigma<=0) sigma=0.01;
+  const d1=(Math.log(S/K)+(r+(sigma*sigma)/2)*T)/(sigma*Math.sqrt(T));
+  const d2=d1-sigma*Math.sqrt(T);
+  if(type==="call") return S*normCdf(d1)-K*Math.exp(-r*T)*normCdf(d2);
+  return K*Math.exp(-r*T)*normCdf(-d2)-S*normCdf(-d1);
+}
+function realizedVol(bars, endIdx, lookback=20){
+  const start=Math.max(1,endIdx-lookback);
+  const rets=[];
+  for(let i=start;i<=endIdx;i++){
+    if(bars[i-1] && bars[i]) rets.push(Math.log(bars[i].close/bars[i-1].close));
+  }
+  if(rets.length<2) return 0.6;
+  const mean=rets.reduce((a,b)=>a+b,0)/rets.length;
+  const variance=rets.reduce((a,b)=>a+(b-mean)**2,0)/rets.length;
+  const stdev=Math.sqrt(variance);
+  const annualized=stdev*Math.sqrt(252);
+  return Math.min(4,Math.max(0.15,annualized));
+}
+const fmt=(n)=>Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const fmtSigned=(n)=>(n>=0?"+":"")+fmt(n);
+
+function daysAgo(n){ const d=new Date(); d.setDate(d.getDate()-n); return d.toISOString().slice(0,10); }
+
+function TickerSearch({ onPick }) {
+  const [q,setQ]=useState("");
+  const [results,setResults]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState("");
+  const timer=useRef(null);
+
+  useEffect(()=>{
+    if(timer.current) clearTimeout(timer.current);
+    if(q.trim().length<1){ setResults([]); return; }
+    timer.current=setTimeout(async ()=>{
+      setLoading(true); setErr("");
+      try{
+        const r=await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+        const d=await r.json();
+        if(d.error) setErr(d.error);
+        setResults(d.matches||[]);
+      }catch(e){ setErr("Search failed"); }
+      setLoading(false);
+    },350);
+  },[q]);
+
+  return (
+    <div style={{marginBottom:10}}>
+      <input
+        value={q}
+        onChange={e=>setQ(e.target.value)}
+        placeholder="Search ticker, e.g. GME, AAPL, TSLA"
+        style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"10px 12px",fontSize:14}}
+      />
+      {loading && <div style={{fontSize:11,color:"#6b7680",marginTop:4}}>searching...</div>}
+      {err && <div style={{fontSize:11,color:"#ff5d5d",marginTop:4}}>{err}</div>}
+      {results.length>0 && (
+        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:6,marginTop:6,maxHeight:220,overflowY:"auto"}}>
+          {results.map((r,i)=>(
+            <div key={i} onClick={()=>{onPick(r.symbol); setResults([]); setQ(r.symbol);}}
+              style={{padding:"8px 12px",borderTop:i>0?"1px solid #1a2224":"none",fontSize:12,display:"flex",justifyContent:"space-between"}}>
+              <span style={{color:"#3ddc84",fontWeight:700}}>{r.symbol}</span>
+              <span style={{color:"#6b7680"}}>{r.name} · {r.exchange}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function App(){
+  const [symbol,setSymbol]=useState("GME");
+  const [startDate,setStartDate]=useState(daysAgo(180));
+  const [endDate,setEndDate]=useState(daysAgo(0));
+  const [interval,setInterval_]=useState("1day");
+  const [bars,setBars]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [loadErr,setLoadErr]=useState("");
+  const [idx,setIdx]=useState(0);
+  const [playing,setPlaying]=useState(false);
+  const [speed,setSpeed]=useState(2);
+  const [cash,setCash]=useState(10000);
+  const [shares,setShares]=useState(0);
+  const [options,setOptions]=useState([]);
+  const [log,setLog]=useState([]);
+  const [orderQty,setOrderQty]=useState(100);
+  const [optType,setOptType]=useState("call");
+  const [strikeOffset,setStrikeOffset]=useState(0.5);
+  const [expiryBars,setExpiryBars]=useState(10);
+  const [contracts,setContracts]=useState(1);
+  const [ended,setEnded]=useState(false);
+  const intervalRef=useRef(null);
+
+  async function loadData(){
+    setLoading(true); setLoadErr(""); setPlaying(false); setEnded(false);
+    try{
+      const r=await fetch(`/api/history?symbol=${encodeURIComponent(symbol)}&start=${startDate}&end=${endDate}&interval=${interval}`);
+      const d=await r.json();
+      if(d.error){ setLoadErr(d.error); setLoading(false); return; }
+      if(!d.bars || d.bars.length<2){ setLoadErr("Not enough data for that range"); setLoading(false); return; }
+      setBars(d.bars);
+      setIdx(0);
+      setCash(10000);
+      setShares(0);
+      setOptions([]);
+      setLog([]);
+    }catch(e){ setLoadErr("Failed to load data"); }
+    setLoading(false);
+  }
+
+  useEffect(()=>{ loadData(); },[]); // initial load
+
+  const current = bars[idx];
+  const price = current ? current.close : 0;
+  const sigma = useMemo(()=> bars.length ? realizedVol(bars, idx) : 0.6, [bars, idx]);
+  const T_PER_BAR_YEARS = interval==="1day" ? 1/252 : 1/(252*78);
+
+  useEffect(()=>{
+    if(playing && bars.length){
+      intervalRef.current = window.setInterval(()=>{
+        setIdx(prev=>{
+          if(prev>=bars.length-1){ setPlaying(false); setEnded(true); return prev; }
+          return prev+1;
+        });
+      }, 600/speed);
+    }
+    return ()=> window.clearInterval(intervalRef.current);
+  },[playing,speed,bars.length]);
+
+  // settle expired options
+  useEffect(()=>{
+    if(!bars.length) return;
+    setOptions(opts=>{
+      const stillOpen=[]; let cashDelta=0; const newLogs=[];
+      for(const o of opts){
+        if(idx>=o.expiryIdx){
+          const intrinsic = o.type==="call" ? Math.max(0,price-o.strike) : Math.max(0,o.strike-price);
+          cashDelta += intrinsic*100*o.contracts;
+          newLogs.push(`${o.type.toUpperCase()} $${o.strike.toFixed(2)} expired ${intrinsic>0?"ITM":"worthless"} — ${intrinsic>0?"+$"+fmt(intrinsic*100*o.contracts):"$0"}`);
+        } else stillOpen.push(o);
+      }
+      if(cashDelta!==0 || newLogs.length){
+        setCash(c=>c+cashDelta);
+        setLog(l=>[...newLogs.map(m=>({t:current?current.date:"", msg:m})), ...l]);
+      }
+      return stillOpen;
+    });
+    // eslint-disable-next-line
+  },[idx]);
+
+  const buyShares=()=>{
+    const cost=orderQty*price;
+    if(cost>cash || !current) return;
+    setCash(c=>c-cost); setShares(s=>s+orderQty);
+    setLog(l=>[{t:current.date,msg:`BUY ${orderQty} ${symbol} @ $${fmt(price)}`},...l]);
+  };
+  const sellShares=()=>{
+    const qty=Math.min(orderQty,shares);
+    if(qty<=0 || !current) return;
+    setCash(c=>c+qty*price); setShares(s=>s-qty);
+    setLog(l=>[{t:current.date,msg:`SELL ${qty} ${symbol} @ $${fmt(price)}`},...l]);
+  };
+  const buyOption=()=>{
+    if(!current) return;
+    const strike=Number((optType==="call"?price+strikeOffset:price-strikeOffset).toFixed(2));
+    const expiryIdx=Math.min(bars.length-1, idx+expiryBars);
+    const T=((expiryIdx-idx)*T_PER_BAR_YEARS)||T_PER_BAR_YEARS;
+    const premium=bsPrice(optType,price,strike,T,0.05,sigma);
+    const cost=premium*100*contracts;
+    if(cost>cash || premium<=0.01) return;
+    setCash(c=>c-cost);
+    setOptions(o=>[...o,{id:Math.random().toString(36).slice(2),type:optType,strike,expiryIdx,entryIdx:idx,premium,contracts}]);
+    setLog(l=>[{t:current.date,msg:`BUY ${contracts}x ${optType.toUpperCase()} $${strike} @ $${fmt(premium)} (prem $${fmt(cost)})`},...l]);
+  };
+  const closeOption=(id)=>{
+    setOptions(opts=>{
+      const o=opts.find(x=>x.id===id);
+      if(!o || !current) return opts;
+      const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
+      const mark=bsPrice(o.type,price,o.strike,T,0.05,sigma);
+      const proceeds=mark*100*o.contracts;
+      setCash(c=>c+proceeds);
+      setLog(l=>[{t:current.date,msg:`SELL ${o.contracts}x ${o.type.toUpperCase()} $${o.strike} @ $${fmt(mark)} (proceeds $${fmt(proceeds)})`},...l]);
+      return opts.filter(x=>x.id!==id);
+    });
+  };
+
+  const optionsValue = options.reduce((sum,o)=>{
+    const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
+    const mark=bsPrice(o.type,price,o.strike,T,0.05,sigma);
+    return sum+mark*100*o.contracts;
+  },0);
+  const equity = cash + shares*price + optionsValue;
+  const pnl = equity-10000;
+  const pnlPct = (pnl/10000)*100;
+
+  // simple inline SVG chart (no external chart lib needed)
+  const chartBars = bars.slice(0, idx+1);
+  const chartW=600, chartH=200;
+  const prices = chartBars.map(b=>b.close);
+  const minP = prices.length? Math.min(...prices)*0.98 : 0;
+  const maxP = prices.length? Math.max(...prices)*1.02 : 1;
+  const pts = chartBars.map((b,i)=>{
+    const x = chartBars.length>1 ? (i/(chartBars.length-1))*chartW : 0;
+    const y = chartH - ((b.close-minP)/(maxP-minP||1))*chartH;
+    return `${x},${y}`;
+  }).join(" ");
+
+  return (
+    <div style={{padding:12,maxWidth:720,margin:"0 auto"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+        <span style={{fontSize:18,fontWeight:700,color:"#eef4f4"}}>Trade Replay</span>
+        <span style={{fontSize:11,color:"#6b7680"}}>real historical data</span>
+      </div>
+
+      <TickerSearch onPick={setSymbol} />
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
+        <div>
+          <div style={{fontSize:9,color:"#6b7680"}}>SYMBOL</div>
+          <input value={symbol} onChange={e=>setSymbol(e.target.value.toUpperCase())}
+            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#6b7680"}}>INTERVAL</div>
+          <select value={interval} onChange={e=>setInterval_(e.target.value)}
+            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}}>
+            <option value="1day">Daily</option>
+            <option value="1h">Hourly</option>
+            <option value="5min">5-Minute</option>
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#6b7680"}}>START DATE</div>
+          <input type="date" value={startDate} onChange={e=>setStartDate(e.target.value)}
+            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#6b7680"}}>END DATE</div>
+          <input type="date" value={endDate} onChange={e=>setEndDate(e.target.value)}
+            style={{width:"100%",background:"#12181a",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:13}} />
+        </div>
+      </div>
+      <button onClick={loadData} disabled={loading}
+        style={{width:"100%",background:"#1a2a24",border:"1px solid #3ddc84",color:"#3ddc84",borderRadius:6,padding:"9px",fontSize:13,fontWeight:700,marginBottom:10}}>
+        {loading ? "Loading real data..." : "Load Data & Reset Session"}
+      </button>
+      {loadErr && <div style={{fontSize:12,color:"#ff5d5d",marginBottom:10}}>{loadErr}</div>}
+
+      {current && (
+      <React.Fragment>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:18,fontWeight:700,color:"#eef4f4"}}>${symbol}</span>
+            <span style={{fontSize:22,fontWeight:700,color: idx>0 && price>=bars[idx-1].close ? "#3ddc84":"#ff5d5d"}}>${fmt(price)}</span>
+          </div>
+          <div style={{fontSize:12,color:"#f5a623",fontWeight:700,textAlign:"right"}}>
+            {current.date}
+            <div style={{fontSize:10,color:"#6b7680",fontWeight:400}}>bar {idx+1} / {bars.length} · IV {(sigma*100).toFixed(0)}%</div>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:8,marginBottom:10}}>
+          {[
+            {label:"EQUITY",val:`$${fmt(equity)}`,color:"#eef4f4"},
+            {label:"CASH",val:`$${fmt(cash)}`,color:"#8a959a"},
+            {label:"SHARES",val:`${shares}`,color:shares>0?"#3ddc84":"#8a959a"},
+            {label:"P&L",val:`${fmtSigned(pnl)} (${fmtSigned(pnlPct)}%)`,color:pnl>=0?"#3ddc84":"#ff5d5d"},
+          ].map((b,i)=>(
+            <div key={i} style={{background:"#12181a",border:"1px solid #20282a",borderRadius:6,padding:"8px 10px"}}>
+              <div style={{fontSize:9,color:"#6b7680",letterSpacing:1}}>{b.label}</div>
+              <div style={{fontSize:13,fontWeight:700,color:b.color}}>{b.val}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
+          <svg width="100%" height={chartH} viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="none">
+            <polyline points={pts} fill="none" stroke="#3ddc84" strokeWidth="2" />
+          </svg>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#6b7680",marginTop:4}}>
+            <span>{bars[0] && bars[0].date}</span>
+            <span>{current.date}</span>
+          </div>
+        </div>
+
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:"8px 10px"}}>
+          <button onClick={()=>setPlaying(p=>!p)} disabled={ended}
+            style={{background:"#3ddc84",border:"none",borderRadius:6,padding:"6px 12px",color:"#0a0e0f",fontWeight:700}}>
+            {playing?"Pause":"Play"}
+          </button>
+          {[1,2,4,8].map(s=>(
+            <button key={s} onClick={()=>setSpeed(s)}
+              style={{background:speed===s?"#20282a":"transparent",border:"1px solid #20282a",color:speed===s?"#eef4f4":"#6b7680",borderRadius:6,padding:"5px 8px",fontSize:11}}>
+              {s}x
+            </button>
+          ))}
+          <div style={{flex:1}}/>
+          <button onClick={()=>{setIdx(0);setCash(10000);setShares(0);setOptions([]);setLog([]);setEnded(false);setPlaying(false);}}
+            style={{background:"transparent",border:"1px solid #20282a",color:"#8a959a",borderRadius:6,padding:"6px 10px",fontSize:11}}>
+            Restart Session
+          </button>
+        </div>
+
+        {ended && (
+          <div style={{background:"#12181a",border:`1px solid ${pnl>=0?"#3ddc84":"#ff5d5d"}`,borderRadius:8,padding:14,marginBottom:10,textAlign:"center"}}>
+            <div style={{fontSize:11,color:"#6b7680",letterSpacing:1}}>SESSION ENDED</div>
+            <div style={{fontSize:24,fontWeight:700,color:pnl>=0?"#3ddc84":"#ff5d5d"}}>{fmtSigned(pnl)} ({fmtSigned(pnlPct)}%)</div>
+            <div style={{fontSize:11,color:"#8a959a",marginTop:4}}>${symbol} · {bars[0].date} → {bars[bars.length-1].date}</div>
+          </div>
+        )}
+
+        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
+          <div style={{fontSize:11,color:"#f5a623",fontWeight:700,marginBottom:8}}>SHARES</div>
+          <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <input type="number" value={orderQty} onChange={e=>setOrderQty(Math.max(1,Number(e.target.value)))}
+              style={{width:90,background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"6px 8px",fontSize:12}} />
+            <span style={{fontSize:11,color:"#6b7680"}}>shares · cost ${fmt(orderQty*price)}</span>
+            <div style={{flex:1}}/>
+            <button onClick={buyShares} disabled={ended || orderQty*price>cash}
+              style={{background:"#1a2a24",border:"1px solid #3ddc84",color:"#3ddc84",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>BUY</button>
+            <button onClick={sellShares} disabled={ended || shares<=0}
+              style={{background:"#2a1a1a",border:"1px solid #ff5d5d",color:"#ff5d5d",borderRadius:6,padding:"7px 14px",fontSize:12,fontWeight:700}}>SELL</button>
+          </div>
+        </div>
+
+        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
+          <div style={{fontSize:11,color:"#f5a623",fontWeight:700,marginBottom:8}}>OPTIONS</div>
+          <div style={{display:"flex",gap:6,marginBottom:8}}>
+            <button onClick={()=>setOptType("call")}
+              style={{flex:1,background:optType==="call"?"#1a2a24":"#0a0e0f",border:`1px solid ${optType==="call"?"#3ddc84":"#20282a"}`,color:optType==="call"?"#3ddc84":"#6b7680",borderRadius:6,padding:"6px",fontSize:12}}>CALL</button>
+            <button onClick={()=>setOptType("put")}
+              style={{flex:1,background:optType==="put"?"#2a1a1a":"#0a0e0f",border:`1px solid ${optType==="put"?"#ff5d5d":"#20282a"}`,color:optType==="put"?"#ff5d5d":"#6b7680",borderRadius:6,padding:"6px",fontSize:12}}>PUT</button>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6,marginBottom:8}}>
+            <div>
+              <div style={{fontSize:9,color:"#6b7680"}}>STRIKE OFFSET $</div>
+              <input type="number" step="0.25" value={strikeOffset} onChange={e=>setStrikeOffset(Number(e.target.value))}
+                style={{width:"100%",background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"5px 6px",fontSize:12}} />
+            </div>
+            <div>
+              <div style={{fontSize:9,color:"#6b7680"}}>EXPIRY (bars)</div>
+              <input type="number" value={expiryBars} onChange={e=>setExpiryBars(Math.max(1,Number(e.target.value)))}
+                style={{width:"100%",background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"5px 6px",fontSize:12}} />
+            </div>
+            <div>
+              <div style={{fontSize:9,color:"#6b7680"}}>CONTRACTS</div>
+              <input type="number" value={contracts} onChange={e=>setContracts(Math.max(1,Number(e.target.value)))}
+                style={{width:"100%",background:"#0a0e0f",border:"1px solid #20282a",color:"#eef4f4",borderRadius:6,padding:"5px 6px",fontSize:12}} />
+            </div>
+          </div>
+          <div style={{fontSize:10,color:"#6b7680",marginBottom:8}}>
+            Strike ${fmt(optType==="call"?price+strikeOffset:price-strikeOffset)} · est. premium $
+            {fmt(bsPrice(optType,price,optType==="call"?price+strikeOffset:price-strikeOffset,(expiryBars*T_PER_BAR_YEARS)||T_PER_BAR_YEARS,0.05,sigma))} / share
+          </div>
+          <button onClick={buyOption} disabled={ended}
+            style={{width:"100%",background:"#1a2318",border:"1px solid #f5a623",color:"#f5a623",borderRadius:6,padding:"8px",fontSize:12,fontWeight:700}}>
+            BUY {contracts}x {optType.toUpperCase()}
+          </button>
+        </div>
+
+        {options.length>0 && (
+          <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,marginBottom:10}}>
+            <div style={{fontSize:11,color:"#8a959a",fontWeight:700,marginBottom:6}}>OPEN OPTIONS</div>
+            {options.map(o=>{
+              const T=Math.max(0,(o.expiryIdx-idx)*T_PER_BAR_YEARS);
+              const mark=bsPrice(o.type,price,o.strike,T,0.05,sigma);
+              const pl=(mark-o.premium)*100*o.contracts;
+              return (
+                <div key={o.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 0",borderTop:"1px solid #1a2224",fontSize:12}}>
+                  <div>
+                    <span style={{color:o.type==="call"?"#3ddc84":"#ff5d5d",fontWeight:700}}>{o.type.toUpperCase()}</span> ${o.strike} × {o.contracts} · {o.expiryIdx-idx} bars left
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{color:pl>=0?"#3ddc84":"#ff5d5d"}}>{fmtSigned(pl)}</span>
+                    <button onClick={()=>closeOption(o.id)} style={{background:"transparent",border:"1px solid #20282a",color:"#8a959a",borderRadius:4,padding:"3px 6px"}}>x</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{background:"#12181a",border:"1px solid #20282a",borderRadius:8,padding:10,maxHeight:160,overflowY:"auto"}}>
+          <div style={{fontSize:11,color:"#8a959a",fontWeight:700,marginBottom:6}}>TAPE</div>
+          {log.length===0 && <div style={{fontSize:11,color:"#4a5458"}}>No trades yet.</div>}
+          {log.map((l,i)=>(
+            <div key={i} style={{fontSize:11,color:"#6b7680",padding:"2px 0"}}>
+              <span style={{color:"#3a4448"}}>{l.t}</span> {l.msg}
+            </div>
+          ))}
+        </div>
+      </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
